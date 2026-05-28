@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Sensitive editorial data — exports contain author/reviewer emails for
+# all submissions (incl. declined). Do NOT commit to a public repo.
+reports/
+
+# Editorial board contact list (contains phone numbers) — decide per-file
+editorialboard.csv
+
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.rds
+*.Rdata
+
+# Quarto / knitr
+/_cache/
+/*_cache/
+/*_files/
+/_site/
+/_book/
+/_output/
+/_freeze/
+.quarto/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
