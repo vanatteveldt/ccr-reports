@@ -5,7 +5,7 @@
 
 # Sensitive editorial data — exports contain author/reviewer emails for
 # all submissions (incl. declined). Do NOT commit to a public repo.
-reports/
+ojs_reports/
 
 # Editorial board contact list (contains phone numbers) — decide per-file
 editorialboard.csv
@@ -32,3 +32,5 @@ editorialboard.csv
 .DS_Store
 Thumbs.db
 *.swp
+
+/reports

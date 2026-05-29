@@ -1,0 +1,999 @@
+---
+title: "CCR Journal Health Report"
+author: "Editorial team"
+date: today
+format:
+  html:
+    toc: true
+    df-print: kable
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(DT)
+
+# .env holds OJS_BASE_URL and OJS_ADMIN_TOKEN; ojs.R defaults to OJS_TOKEN.
+readRenviron(".env")
+Sys.setenv(OJS_TOKEN = Sys.getenv("OJS_ADMIN_TOKEN"))
+
+source("ojs.R")
+
+bucket <- function(label) {
+    l <- tolower(label %||% "")
+    dplyr::case_when(
+        grepl("publish|production|copyedit|schedul", l) ~ "Accepted",
+        grepl("declin|reject", l) ~ "Rejected",
+        TRUE ~ "Pending"
+    )
+}
+
+parse_dt <- function(x) as.POSIXct(x, tz = "UTC", format = "%Y-%m-%d %H:%M:%S")
+```
+
+```{r load-data}
+#| cache: true
+client <- ojs_client()
+submissions <- ojs_submissions(client)
+decisions <- ojs_decisions_bulk(client, submissions$id)
+```
+
+## Submissions by year and final status
+
+Pipeline volume per year and what happened to each cohort.
+
+```{r submissions-by-year-status}
+subs_by_section <- submissions |>
+    mutate(
+        year    = substr(date_submitted, 1, 4),
+        status  = bucket(status_label),
+        section = ifelse(section_id == 122L,
+                         "Research Article",
+                         "Other (special issues, notes, tools)")
+    ) |>
+    filter(nzchar(year))
+
+build_year_status <- function(df, caption) {
+    df |>
+        mutate(status = factor(status,
+                               levels = c("Accepted", "Rejected", "Pending"))) |>
+        count(year, status, .drop = FALSE) |>
+        pivot_wider(names_from = status, values_from = n, values_fill = 0) |>
+        mutate(
+            Total = Accepted + Rejected + Pending,
+            `Accept rate` = ifelse(
+                (Accepted + Rejected) > 0,
+                sprintf("%.0f%%", 100 * Accepted / (Accepted + Rejected)),
+                "—"
+            )
+        ) |>
+        arrange(year) |>
+        select(Year = year, Accepted, Rejected, Pending, Total, `Accept rate`) |>
+        kable(caption = caption)
+}
+
+subs_by_section |>
+    filter(section == "Research Article") |>
+    build_year_status("Research Article submissions per year by final status")
+```
+
+```{r submissions-by-year-status-other}
+subs_by_section |>
+    filter(section != "Research Article") |>
+    build_year_status(
+        "Other (special issues, notes, tools) submissions per year by final status"
+    )
+```
+
+::: {.callout-note collapse="true" title="Column definitions and section split"}
+- **Year** — year of `dateSubmitted`.
+- **Accepted** — published or in copyediting/production.
+- **Rejected** — declined (desk-reject or post-review).
+- **Pending** — still in queue, review, or revision.
+- **Accept rate** — Accepted / (Accepted + Rejected). Excludes Pending papers
+  from the denominator. Recent submission-years still have many Pending papers
+  whose outcomes will move the rate as they finalize.
+
+The split is by OJS `sectionId` of the publication's first version. Section
+122 is treated as "Research Article" (the main section, used every year since
+2018); all other sections are bundled as "Other" (special issues, research
+notes, tool announcements — the API doesn't expose section names, so they
+can't be split further from this report alone).
+:::
+
+## Decision turnaround times
+
+How fast papers move from submission to first decision, and through subsequent
+review rounds to a final outcome.
+
+```{r decision-times-overall}
+dec <- decisions |>
+    mutate(date_decided = parse_dt(date_decided)) |>
+    filter(!is.na(date_decided))
+
+subs_dt <- submissions |>
+    mutate(
+        date_submitted = parse_dt(date_submitted),
+        final          = bucket(status_label)
+    ) |>
+    select(id, date_submitted, final)
+
+final_decisions <- dec |>
+    mutate(kind = dplyr::case_when(
+        grepl("accept", tolower(label)) & !grepl("production", tolower(label)) ~ "accept",
+        grepl("declin", tolower(label)) ~ "decline",
+        TRUE ~ NA_character_
+    )) |>
+    filter(!is.na(kind)) |>
+    group_by(submission_id, kind) |>
+    summarise(final_date = max(date_decided), .groups = "drop") |>
+    pivot_wider(
+        names_from = kind, values_from = final_date,
+        names_prefix = "date_"
+    )
+
+per_sub <- dec |>
+    group_by(submission_id) |>
+    summarise(
+        first_decision = min(date_decided),
+        had_review = any(!is.na(review_round_id) & review_round_id > 0),
+        .groups = "drop"
+    ) |>
+    inner_join(subs_dt, by = c("submission_id" = "id")) |>
+    left_join(final_decisions, by = "submission_id") |>
+    mutate(
+        final_decision_date = dplyr::case_when(
+            final == "Accepted" ~ date_accept,
+            final == "Rejected" ~ date_decline,
+            TRUE ~ as.POSIXct(NA)
+        ),
+        days_to_first = as.numeric(difftime(first_decision, date_submitted, units = "days")),
+        days_to_last = as.numeric(difftime(final_decision_date, date_submitted, units = "days"))
+    )
+
+per_sub <- per_sub |>
+    mutate(year = substr(as.character(date_submitted), 1, 4)) |>
+    filter(year >= "2024")
+
+summary_row <- function(df) {
+    final_df <- df |>
+        filter(final != "Pending", had_review, !is.na(final_decision_date))
+    tibble(
+        first_N      = sum(!is.na(df$days_to_first)),
+        first_median = round(median(df$days_to_first, na.rm = TRUE), 1),
+        first_mean   = round(mean(df$days_to_first, na.rm = TRUE), 1),
+        final_N      = nrow(final_df),
+        final_median = round(median(final_df$days_to_last, na.rm = TRUE), 1),
+        final_mean   = round(mean(final_df$days_to_last, na.rm = TRUE), 1)
+    )
+}
+
+by_year <- per_sub |>
+    filter(nzchar(year)) |>
+    group_by(Year = year) |>
+    group_modify(~ summary_row(.x)) |>
+    ungroup() |>
+    arrange(Year)
+
+total <- summary_row(per_sub) |>
+    mutate(Year = "Total") |>
+    select(Year, everything())
+
+bind_rows(by_year, total) |>
+    setNames(c("Year", "N", "Median", "Mean", "N", "Median", "Mean")) |>
+    kable(caption = "Time to first and final decision, per submission year") |>
+    add_header_above(c(
+        " " = 1,
+        "First decision (days)" = 3,
+        "Final decision (days)" = 3
+    ))
+```
+
+Review-round duration: how long each round of revision-and-review takes.
+
+```{r decision-times-rounds}
+# A round closes at the *first* AE/EiC decision that resolves the review
+# (Accept / Decline / Request Revisions / Resubmit). Later same-round_id
+# decisions are admin events ("New Review Round" marking author resubmission)
+# or post-revision accepts that no longer involve reviewers — including those
+# in round_end would inflate "deciding" time. See submission 8874 for the
+# canonical example.
+round_closing_labels <- c(
+    "Accept Submission", "Decline Submission",
+    "Request Revisions", "Resubmit for Review"
+)
+
+rounds <- dec |>
+    filter(!is.na(review_round_id), review_round_id > 0,
+           label %in% round_closing_labels) |>
+    group_by(submission_id, review_round_id) |>
+    summarise(round_end = min(date_decided), .groups = "drop") |>
+    arrange(submission_id, round_end) |>
+    group_by(submission_id) |>
+    mutate(
+        round_num = row_number(),
+        prev_end = lag(round_end)
+    ) |>
+    ungroup() |>
+    inner_join(subs_dt |> select(id, date_submitted),
+        by = c("submission_id" = "id")
+    ) |>
+    mutate(
+        round_start = coalesce(prev_end, date_submitted),
+        round_days  = as.numeric(difftime(round_end, round_start, units = "days")),
+        year        = substr(as.character(date_submitted), 1, 4)
+    ) |>
+    filter(year >= "2024")
+
+round_summary_row <- function(df) {
+    r1 <- df |> filter(round_num == 1)
+    rN <- df |> filter(round_num >= 2)
+    per_sub_rounds <- df |>
+        group_by(submission_id) |>
+        summarise(n_rounds = max(round_num), .groups = "drop")
+    tibble(
+        r1_N       = nrow(r1),
+        r1_median  = round(median(r1$round_days, na.rm = TRUE), 1),
+        r1_mean    = round(mean(r1$round_days, na.rm = TRUE), 1),
+        rN_N       = nrow(rN),
+        rN_median  = round(median(rN$round_days, na.rm = TRUE), 1),
+        rN_mean    = round(mean(rN$round_days, na.rm = TRUE), 1),
+        avg_rounds = round(mean(per_sub_rounds$n_rounds), 2)
+    )
+}
+
+by_year_rounds <- rounds |>
+    group_by(Year = year) |>
+    group_modify(~ round_summary_row(.x)) |>
+    ungroup() |>
+    arrange(Year)
+
+total_rounds <- round_summary_row(rounds) |>
+    mutate(Year = "Total") |>
+    select(Year, everything())
+
+bind_rows(by_year_rounds, total_rounds) |>
+    setNames(c("Year", "N", "Median", "Mean", "N", "Median", "Mean", "Avg rounds")) |>
+    kable(caption = "Review round duration, per submission year") |>
+    add_header_above(c(
+        " " = 1,
+        "First round (days)" = 3,
+        "Subsequent rounds (days)" = 3,
+        " " = 1
+    ))
+```
+
+::: {.callout-note collapse="true" title="Column definitions and caveats"}
+- **First decision (days)** — days from submission to the first editorial
+  decision on the paper.
+- **Final decision (days)** — days from submission to the last decision, only
+  for submissions that have reached a final status and went through at least
+  one review round.
+- **First round (days)** — round 1 duration: submission → round-1 closing
+  decision.
+- **Subsequent rounds (days)** — round N≥2 duration: previous round's close →
+  this round's closing decision. All N≥2 rounds pooled.
+- **Avg rounds** — mean number of review rounds per submission in the cohort.
+- **Restriction**: submissions from 2024 onwards. Earlier papers were migrated
+  from a previous OJS install and their decision history wasn't carried over.
+:::
+
+### Round timing decomposed
+
+Where editorial cycles actually spend their time: waiting on authors, finding
+reviewers, waiting on reviews, or deciding.
+
+```{r round-decomposition}
+reviews_csv <- sort(Sys.glob("ojs_reports/reviews-*.csv"), decreasing = TRUE)[1]
+reviews <- read.csv(reviews_csv, stringsAsFactors = FALSE, check.names = FALSE) |>
+    rename(
+        submission_id  = `Submission ID`,
+        round          = Round,
+        date_assigned  = `Date Assigned`,
+        date_confirmed = `Date Confirmed`,
+        date_completed = `Date Completed`,
+        declined       = Declined,
+        cancelled      = Cancelled
+    ) |>
+    mutate(
+        date_confirmed = parse_dt(date_confirmed),
+        date_completed = parse_dt(date_completed),
+        completed_ok   = declined == "No" & cancelled == "No" &
+                         !is.na(date_completed)
+    )
+
+per_round_reviews <- reviews |>
+    group_by(submission_id, round) |>
+    summarise(
+        n_invited      = n(),
+        n_completed    = sum(completed_ok),
+        last_confirmed = suppressWarnings(max(date_confirmed[completed_ok],
+                                              na.rm = TRUE)),
+        last_completed = suppressWarnings(max(date_completed[completed_ok],
+                                              na.rm = TRUE)),
+        .groups        = "drop"
+    ) |>
+    mutate(
+        last_confirmed = dplyr::if_else(is.finite(last_confirmed),
+                                        last_confirmed, as.POSIXct(NA)),
+        last_completed = dplyr::if_else(is.finite(last_completed),
+                                        last_completed, as.POSIXct(NA))
+    )
+
+nrr_dates <- dec |>
+    filter(label == "New Review Round") |>
+    select(submission_id, nrr_date = date_decided) |>
+    arrange(submission_id, nrr_date) |>
+    group_by(submission_id) |>
+    mutate(opens_round_num = row_number() + 1L) |>
+    ungroup()
+
+round_intervals_reviewed <- rounds |>
+    select(submission_id, round_num, round_start, round_end) |>
+    inner_join(per_round_reviews,
+        by = c("submission_id", "round_num" = "round")
+    ) |>
+    left_join(
+        nrr_dates |> select(submission_id,
+                            round_num = opens_round_num, nrr_date),
+        by = c("submission_id", "round_num")
+    ) |>
+    mutate(
+        # Round 1 has no NRR (no revision phase); round N>=2 uses NRR as
+        # the boundary. If NRR is missing for round N (unusual), fall back
+        # to round_start.
+        finding_start = dplyr::case_when(
+            round_num == 1     ~ round_start,
+            !is.na(nrr_date)   ~ nrr_date,
+            TRUE               ~ round_start
+        ),
+        year          = substr(as.character(round_end), 1, 4),
+        waiting_days  = ifelse(round_num == 1, NA_real_,
+                               as.numeric(difftime(finding_start, round_start,
+                                                   units = "days"))),
+        finding_days  = as.numeric(difftime(last_confirmed, finding_start,
+                                            units = "days")),
+        review_days   = as.numeric(difftime(last_completed, last_confirmed,
+                                            units = "days")),
+        decide_days   = as.numeric(difftime(round_end, last_completed,
+                                            units = "days")),
+        total_days    = as.numeric(difftime(round_end, round_start,
+                                            units = "days")),
+        opened_date   = dplyr::case_when(
+            round_num == 1   ~ as.POSIXct(NA),
+            !is.na(nrr_date) ~ nrr_date,
+            TRUE             ~ as.POSIXct(NA)
+        ),
+        kind          = "review"
+    )
+
+# Post-revision rounds: same review_round_id with both a revisions-style
+# decision and a later Accept/Decline. Round_start = the revisions decision;
+# round_end = the final decision; waiting = upload - rev_date; deciding =
+# final - upload.
+revision_labels <- c("Resubmit for Review", "Request Revisions")
+final_labels    <- c("Accept Submission", "Decline Submission")
+
+post_rev_events <- dec |>
+    filter(!is.na(review_round_id), review_round_id > 0,
+           label %in% c(revision_labels, final_labels)) |>
+    group_by(submission_id, review_round_id) |>
+    summarise(
+        rev_date   = suppressWarnings(min(
+            date_decided[label %in% revision_labels])),
+        final_date = suppressWarnings(max(
+            date_decided[label %in% final_labels])),
+        .groups    = "drop"
+    ) |>
+    filter(is.finite(rev_date), is.finite(final_date),
+           final_date > rev_date)
+
+revision_files <- ojs_files_bulk(client,
+    unique(post_rev_events$submission_id)) |>
+    mutate(created_at = parse_dt(created_at)) |>
+    filter(!is.na(created_at))
+
+post_rev_intervals <- post_rev_events |>
+    inner_join(revision_files, by = "submission_id",
+               relationship = "many-to-many") |>
+    filter(created_at >= rev_date, created_at <= final_date) |>
+    group_by(submission_id, review_round_id, rev_date, final_date) |>
+    summarise(upload_date = max(created_at), .groups = "drop") |>
+    transmute(
+        submission_id,
+        round_num      = NA_integer_,
+        round_start    = rev_date,
+        round_end      = final_date,
+        opened_date    = upload_date,
+        n_invited      = 0L,
+        n_completed    = 0L,
+        last_confirmed = as.POSIXct(NA),
+        last_completed = as.POSIXct(NA),
+        year           = substr(as.character(final_date), 1, 4),
+        waiting_days   = as.numeric(difftime(upload_date, rev_date,
+                                             units = "days")),
+        finding_days   = NA_real_,
+        review_days    = NA_real_,
+        decide_days    = as.numeric(difftime(final_date, upload_date,
+                                             units = "days")),
+        total_days     = as.numeric(difftime(final_date, rev_date,
+                                             units = "days")),
+        kind           = "post-revision"
+    )
+
+round_intervals <- bind_rows(round_intervals_reviewed, post_rev_intervals)
+
+med <- function(x) round(median(x, na.rm = TRUE), 1)
+
+interval_row <- function(df) {
+    ok  <- df |> filter(kind == "post-revision" | n_completed > 0)
+    nok <- df |> filter(kind == "review", n_completed == 0)
+    tibble(
+        N            = nrow(ok),
+        N_post_rev   = sum(ok$kind == "post-revision"),
+        waiting      = med(ok$waiting_days),
+        finding      = med(ok$finding_days),
+        reviewing    = med(ok$review_days),
+        deciding     = med(ok$decide_days),
+        total        = med(ok$total_days),
+        no_reviews_N = nrow(nok)
+    )
+}
+
+by_year_int <- round_intervals |>
+    group_by(Year = year) |>
+    group_modify(~ interval_row(.x)) |>
+    ungroup() |>
+    arrange(Year)
+
+total_int <- interval_row(round_intervals) |>
+    mutate(Year = "Total") |>
+    select(Year, everything())
+
+bind_rows(by_year_int, total_int) |>
+    select(-N_post_rev, -no_reviews_N) |>
+    setNames(c("Year", "N rounds",
+               "Waiting", "Finding", "Reviewing", "Deciding",
+               "Total round")) |>
+    kable(caption = "Median days per phase of an editorial round (closing-decision year)")
+```
+
+::: {.callout-note collapse="true" title="Phase definitions and data sources"}
+- **Waiting for revision** (round 2+ and post-revision rounds) — previous
+  round's close → "New Review Round" decision (for review rounds) or revision
+  file upload (for post-revision rounds).
+- **Finding reviewers** — round start → last `Date Confirmed` among reviewers
+  who ultimately completed a review.
+- **Reviewing** — last `Date Confirmed` → last `Date Completed`.
+- **Deciding** — last `Date Completed` (or revision upload for post-revision
+  rounds) → round-closing decision.
+- **Total round** — start of the round → its closing decision.
+
+Two kinds of rounds are pooled:
+
+1. **Review rounds** — author resubmits, editor sends out for review, reviews
+   come in, editor decides.
+2. **Post-revision rounds** — editor closed a previous round with
+   `Request Revisions` / `Resubmit for Review` and then accepted/declined in
+   the same `review_round_id` without opening another review round. No
+   Finding/Reviewing, just Waiting + Deciding.
+
+Review rounds where everyone declined or ghosted are excluded (shown
+separately in the "w/o completed reviews" column). Year is the round's
+closing-decision year.
+
+Data: reviewer timeline from `ojs_reports/reviews-*.csv` (the API only exposes
+deadlines, not actual confirm/complete timestamps); revision file uploads from
+`/submissions/{id}/files?fileStages=15`.
+:::
+
+## AE statistics
+
+Current workload and recent throughput per active AE/EiC. Two tables: past
+365 days, and all time.
+
+```{r ae-performance}
+aes <- read.csv("editors.csv", stringsAsFactors = FALSE) |>
+    filter(role %in% c("AE", "EiC"), status == "current")
+
+ae_subs <- purrr::map_dfr(aes$editor_id, function(eid) {
+    ojs_submissions(client, assigned_to = eid) |>
+        mutate(editor_id = eid)
+})
+
+cutoff <- as.POSIXct(Sys.Date() - 365, tz = "UTC")
+
+first_dec <- decisions |>
+    mutate(date_decided = parse_dt(date_decided)) |>
+    filter(!is.na(date_decided)) |>
+    group_by(submission_id) |>
+    summarise(first_decision = min(date_decided), .groups = "drop")
+
+# Final-decision date: last Accept/Decline on the paper.
+final_dec <- decisions |>
+    mutate(date_decided = parse_dt(date_decided)) |>
+    filter(label %in% c("Accept Submission", "Decline Submission"),
+           !is.na(date_decided)) |>
+    group_by(submission_id) |>
+    summarise(final_decision = max(date_decided), .groups = "drop")
+
+ae_perf <- ae_subs |>
+    mutate(
+        date_submitted = parse_dt(date_submitted),
+        outcome        = bucket(status_label)
+    ) |>
+    left_join(first_dec, by = c("id" = "submission_id")) |>
+    mutate(days_to_first = as.numeric(
+        difftime(first_decision, date_submitted, units = "days")
+    ))
+
+current_load <- ae_perf |>
+    filter(outcome == "Pending") |>
+    count(editor_id, name = "currently_assigned")
+
+recent <- ae_perf |> filter(date_submitted >= cutoff)
+
+total_summary <- recent |>
+    group_by(editor_id) |>
+    summarise(total_assigned = n(), .groups = "drop")
+
+# First-decision time: only for first decisions taken in the past 365 days,
+# regardless of submission date.
+first_dec_summary <- ae_subs |>
+    select(submission_id = id, editor_id,
+           date_submitted_str = date_submitted) |>
+    inner_join(first_dec, by = "submission_id") |>
+    filter(first_decision >= cutoff) |>
+    mutate(days_to_first = as.numeric(difftime(
+        first_decision, parse_dt(date_submitted_str), units = "days"
+    ))) |>
+    group_by(editor_id) |>
+    summarise(
+        median_days_to_first = round(median(days_to_first, na.rm = TRUE), 1),
+        .groups = "drop"
+    )
+
+# Final-decision time: same logic, but for the last Accept/Decline.
+final_dec_summary <- ae_subs |>
+    select(submission_id = id, editor_id,
+           date_submitted_str = date_submitted) |>
+    inner_join(final_dec, by = "submission_id") |>
+    filter(final_decision >= cutoff) |>
+    mutate(days_to_final = as.numeric(difftime(
+        final_decision, parse_dt(date_submitted_str), units = "days"
+    ))) |>
+    group_by(editor_id) |>
+    summarise(
+        median_days_to_final = round(median(days_to_final, na.rm = TRUE), 1),
+        .groups = "drop"
+    )
+
+# Average review rounds per paper that went through review (>=1 round).
+# 365d window: papers whose *final decision* is in the past 365 days — same
+# decision-date semantics as the other 365d metrics.
+rounds_per_sub <- rounds |>
+    group_by(submission_id) |>
+    summarise(n_rounds = max(round_num), .groups = "drop")
+
+avg_rounds_summary <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(final_dec, by = "submission_id") |>
+    filter(final_decision >= cutoff) |>
+    inner_join(rounds_per_sub, by = "submission_id") |>
+    group_by(editor_id) |>
+    summarise(avg_rounds = round(mean(n_rounds), 2), .groups = "drop")
+
+# Accept rate: any Accept/Decline decision on an AE's assigned paper, in the
+# last 365 days. Counted by decision date, not submission date.
+ae_decisions <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(
+        decisions |>
+            mutate(date_decided = parse_dt(date_decided)) |>
+            filter(!is.na(date_decided),
+                   label %in% c("Accept Submission", "Decline Submission"),
+                   date_decided >= cutoff) |>
+            select(submission_id, label, date_decided),
+        by = "submission_id",
+        relationship = "many-to-many"
+    )
+
+accept_summary <- ae_decisions |>
+    group_by(editor_id) |>
+    summarise(
+        accepted    = sum(label == "Accept Submission"),
+        rejected    = sum(label == "Decline Submission"),
+        accept_rate = ifelse(
+            (accepted + rejected) > 0,
+            round(100 * accepted / (accepted + rejected), 1),
+            NA_real_
+        ),
+        .groups = "drop"
+    )
+
+aes |>
+    select(editor_id, AE = full_name) |>
+    left_join(current_load, by = "editor_id") |>
+    left_join(total_summary, by = "editor_id") |>
+    left_join(first_dec_summary, by = "editor_id") |>
+    left_join(final_dec_summary, by = "editor_id") |>
+    left_join(avg_rounds_summary, by = "editor_id") |>
+    left_join(accept_summary, by = "editor_id") |>
+    mutate(
+        currently_assigned = tidyr::replace_na(currently_assigned, 0L),
+        total_assigned     = tidyr::replace_na(total_assigned, 0L),
+        accepted           = tidyr::replace_na(accepted, 0L),
+        rejected           = tidyr::replace_na(rejected, 0L),
+        decided            = accepted + rejected,
+        accept_rate_str    = ifelse(
+            decided == 0,
+            "—",
+            sprintf("%.0f%% (%d/%d)", accept_rate, accepted, decided)
+        )
+    ) |>
+    select(
+        AE,
+        `Currently assigned`     = currently_assigned,
+        `Assigned (365d)`        = total_assigned,
+        `Days to 1st decision`   = median_days_to_first,
+        `Days to final decision` = median_days_to_final,
+        `Avg rounds`             = avg_rounds,
+        `Accept rate (decided)`  = accept_rate_str
+    ) |>
+    kable(caption = sprintf(
+        "AE statistics past 365 days (since %s)",
+        format(Sys.Date() - 365)
+    ))
+```
+
+```{r ae-performance-alltime}
+# All-time: total assigned, median time-to-first-decision, accept rate.
+total_summary_all <- ae_subs |>
+    group_by(editor_id) |>
+    summarise(total_assigned = n(), .groups = "drop")
+
+first_dec_summary_all <- ae_subs |>
+    select(submission_id = id, editor_id,
+           date_submitted_str = date_submitted) |>
+    inner_join(first_dec, by = "submission_id") |>
+    mutate(days_to_first = as.numeric(difftime(
+        first_decision, parse_dt(date_submitted_str), units = "days"
+    ))) |>
+    group_by(editor_id) |>
+    summarise(
+        median_days_to_first = round(median(days_to_first, na.rm = TRUE), 1),
+        .groups = "drop"
+    )
+
+final_dec_summary_all <- ae_subs |>
+    select(submission_id = id, editor_id,
+           date_submitted_str = date_submitted) |>
+    inner_join(final_dec, by = "submission_id") |>
+    mutate(days_to_final = as.numeric(difftime(
+        final_decision, parse_dt(date_submitted_str), units = "days"
+    ))) |>
+    group_by(editor_id) |>
+    summarise(
+        median_days_to_final = round(median(days_to_final, na.rm = TRUE), 1),
+        .groups = "drop"
+    )
+
+avg_rounds_summary_all <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(rounds_per_sub, by = "submission_id") |>
+    group_by(editor_id) |>
+    summarise(avg_rounds = round(mean(n_rounds), 2), .groups = "drop")
+
+accept_summary_all <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(
+        decisions |>
+            filter(label %in% c("Accept Submission", "Decline Submission")) |>
+            select(submission_id, label),
+        by = "submission_id",
+        relationship = "many-to-many"
+    ) |>
+    group_by(editor_id) |>
+    summarise(
+        accepted    = sum(label == "Accept Submission"),
+        rejected    = sum(label == "Decline Submission"),
+        accept_rate = ifelse(
+            (accepted + rejected) > 0,
+            round(100 * accepted / (accepted + rejected), 1),
+            NA_real_
+        ),
+        .groups = "drop"
+    )
+
+aes |>
+    select(editor_id, AE = full_name) |>
+    left_join(current_load, by = "editor_id") |>
+    left_join(total_summary_all, by = "editor_id") |>
+    left_join(first_dec_summary_all, by = "editor_id") |>
+    left_join(final_dec_summary_all, by = "editor_id") |>
+    left_join(avg_rounds_summary_all, by = "editor_id") |>
+    left_join(accept_summary_all, by = "editor_id") |>
+    mutate(
+        currently_assigned = tidyr::replace_na(currently_assigned, 0L),
+        total_assigned     = tidyr::replace_na(total_assigned, 0L),
+        accepted           = tidyr::replace_na(accepted, 0L),
+        rejected           = tidyr::replace_na(rejected, 0L),
+        decided            = accepted + rejected,
+        accept_rate_str    = ifelse(
+            decided == 0,
+            "—",
+            sprintf("%.0f%% (%d/%d)", accept_rate, accepted, decided)
+        )
+    ) |>
+    select(
+        AE,
+        `Currently assigned`     = currently_assigned,
+        `Assigned (all time)`    = total_assigned,
+        `Days to 1st decision`   = median_days_to_first,
+        `Days to final decision` = median_days_to_final,
+        `Avg rounds`             = avg_rounds,
+        `Accept rate (decided)`  = accept_rate_str
+    ) |>
+    kable(caption = "AE statistics all time")
+```
+
+::: {.callout-note collapse="true" title="Column definitions"}
+- **Currently assigned** — submissions where the AE is the responsible editor
+  (OJS `assignedTo`) and the submission is still in flight (not declined,
+  published, or in production). No date restriction.
+- **Assigned (365d / all time)** — submissions assigned to the AE whose
+  `dateSubmitted` falls within the window.
+- **Days to 1st decision** — for each first decision *taken* in the window on
+  the AE's assigned papers, days from submission to that decision, median
+  across those decisions.
+- **Days to final decision** — same logic but for the last `Accept Submission`
+  or `Decline Submission` decision on the paper.
+- **Avg rounds** — average number of review rounds per paper that went through
+  review (papers with no review rounds excluded). For the 365d table, restricted
+  to papers whose final decision is in the past 365 days.
+- **Accept rate (decided)** — of all `Accept Submission` / `Decline Submission`
+  decisions on the AE's assigned papers, taken in the window, percent
+  accepted. Numerator/denominator shown in parentheses.
+
+The 365-day window cuts by *decision date* for the time-to-decision medians
+and the accept rate, but by *submission date* for the "Assigned (365d)" count.
+:::
+
+### Round timing per AE
+
+Same intervals as the decomposed table above, broken down by handling AE/EiC.
+Small N — single slow rounds will move medians a lot.
+
+```{r ae-round-timing}
+ae_round_summary_fn <- function(intervals) {
+    intervals |>
+        group_by(editor_id) |>
+        summarise(
+            n_rounds   = n(),
+            waiting    = med(waiting_days),
+            finding    = med(finding_days),
+            reviewing  = med(review_days),
+            deciding   = med(decide_days),
+            total      = med(total_days),
+            .groups    = "drop"
+        )
+}
+
+ae_round_render <- function(summary_df, caption) {
+    aes |>
+        select(editor_id, AE = full_name) |>
+        left_join(summary_df, by = "editor_id") |>
+        mutate(n_rounds = tidyr::replace_na(n_rounds, 0L)) |>
+        select(
+            AE,
+            `N rounds`    = n_rounds,
+            Waiting       = waiting,
+            Finding       = finding,
+            Reviewing     = reviewing,
+            Deciding      = deciding,
+            `Total round` = total
+        ) |>
+        kable(caption = caption)
+}
+
+ae_rounds_365 <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(
+        round_intervals |>
+            filter(kind == "post-revision" | n_completed > 0,
+                   round_end >= cutoff),
+        by = "submission_id",
+        relationship = "many-to-many"
+    )
+
+ae_round_render(
+    ae_round_summary_fn(ae_rounds_365),
+    sprintf("Median days per round phase, per AE (rounds closed since %s)",
+            format(Sys.Date() - 365))
+)
+```
+
+```{r ae-round-timing-alltime}
+ae_rounds_all <- ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(
+        round_intervals |>
+            filter(kind == "post-revision" | n_completed > 0),
+        by = "submission_id",
+        relationship = "many-to-many"
+    )
+
+ae_round_render(
+    ae_round_summary_fn(ae_rounds_all),
+    "Median days per round phase, per AE (all time)"
+)
+```
+
+<style>
+.dt-raw .dataTables_wrapper,
+.dt-raw table.dataTable,
+.dt-raw table.dataTable th,
+.dt-raw table.dataTable td {
+    font-size: 12px;
+}
+.dt-raw table.dataTable th,
+.dt-raw table.dataTable td {
+    padding: 3px 6px;
+}
+/* Shrink the per-column filter inputs in the header */
+.dt-raw .dataTables_wrapper input[type="search"],
+.dt-raw .dataTables_wrapper .form-control {
+    font-size: 12px;
+    height: auto;
+    padding: 1px 22px 1px 6px;
+    line-height: 1.3;
+}
+.dt-raw .dataTables_wrapper .form-group {
+    margin: 0;
+}
+.dt-raw .dataTables_wrapper .form-control-feedback {
+    height: auto;
+    line-height: 1.6;
+    font-size: 11px;
+}
+</style>
+
+### Detailed information per review round
+
+Per-round raw timestamps for every review and post-revision round. Sortable
+by clicking any column header (date columns sort by elapsed days, not text).
+Cells shaded green → red by the displayed day count.
+
+::: {.dt-raw}
+
+```{r ae-round-raw}
+fmt_gap <- function(date, prior = NULL) {
+    months <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    base <- ifelse(
+        is.na(date), "—",
+        sprintf("%d %s",
+                as.integer(format(date, "%d")),
+                months[as.integer(format(date, "%m"))])
+    )
+    if (is.null(prior)) return(base)
+    days <- as.integer(round(as.numeric(
+        difftime(date, prior, units = "days"))))
+    ifelse(!is.na(date) & !is.na(prior),
+           sprintf("%s (%dd)", base, days), base)
+}
+
+ae_subs |>
+    select(submission_id = id, editor_id) |>
+    inner_join(
+        round_intervals |>
+            filter(kind == "post-revision" | n_completed > 0),
+        by = "submission_id",
+        relationship = "many-to-many"
+    ) |>
+    inner_join(aes |> select(editor_id, AE = full_name), by = "editor_id") |>
+    mutate(AE = sub(" .*", "", AE)) |>
+    arrange(submission_id, round_end) |>
+    group_by(submission_id) |>
+    mutate(display_round = row_number()) |>
+    ungroup() |>
+    arrange(AE, submission_id, display_round) |>
+    mutate(
+        upload_actual   = coalesce(opened_date, round_start),
+        request_display = dplyr::if_else(
+            !is.na(round_num) & round_num == 1,
+            as.POSIXct(NA), round_start
+        ),
+        decided_prev    = coalesce(last_completed, last_confirmed,
+                                   upload_actual)
+    ) |>
+    transmute(
+        AE,
+        Year              = substr(as.character(upload_actual), 1, 4),
+        `Subm.`           = submission_id,
+        Rnd               = display_round,
+        Requested         = fmt_gap(request_display),
+        Uploaded          = fmt_gap(upload_actual, request_display),
+        `Reviewers found` = fmt_gap(last_confirmed, upload_actual),
+        `Reviews done`    = fmt_gap(last_completed, last_confirmed),
+        Decided           = fmt_gap(round_end, decided_prev),
+        waiting_d   = as.integer(round(as.numeric(
+            difftime(upload_actual, request_display, units = "days")))),
+        finding_d   = as.integer(round(as.numeric(
+            difftime(last_confirmed, upload_actual, units = "days")))),
+        reviewing_d = as.integer(round(as.numeric(
+            difftime(last_completed, last_confirmed, units = "days")))),
+        deciding_d  = as.integer(round(as.numeric(
+            difftime(round_end, decided_prev, units = "days")))),
+        requested_n = as.numeric(request_display)
+    ) |>
+    datatable(
+        rownames = FALSE,
+        filter   = "top",
+        class    = "compact stripe hover row-border",
+        options  = list(
+            pageLength = 20,
+            scrollX    = TRUE,
+            columnDefs = list(
+                list(visible = FALSE, targets = c(9, 10, 11, 12, 13)),
+                list(orderData = 13, targets = 4),  # Requested → ts
+                list(orderData = 9,  targets = 5),  # Uploaded → waiting
+                list(orderData = 10, targets = 6),  # Reviewers found
+                list(orderData = 11, targets = 7),  # Reviews done
+                list(orderData = 12, targets = 8)   # Decided → deciding
+            )
+        )
+    ) |>
+    formatStyle("Uploaded", "waiting_d",
+        backgroundColor = styleInterval(
+            c(20, 40, 60, 80, 100),
+            c("#c8e6c9", "#dcedc8", "#fff9c4",
+              "#ffe0b2", "#ffcdd2", "#ef9a9a"))) |>
+    formatStyle("Reviewers found", "finding_d",
+        backgroundColor = styleInterval(
+            c(20, 40, 60, 80, 100),
+            c("#c8e6c9", "#dcedc8", "#fff9c4",
+              "#ffe0b2", "#ffcdd2", "#ef9a9a"))) |>
+    formatStyle("Reviews done", "reviewing_d",
+        backgroundColor = styleInterval(
+            c(20, 40, 60, 80, 100),
+            c("#c8e6c9", "#dcedc8", "#fff9c4",
+              "#ffe0b2", "#ffcdd2", "#ef9a9a"))) |>
+    formatStyle("Decided", "deciding_d",
+        backgroundColor = styleInterval(
+            c(20, 40, 60, 80, 100),
+            c("#c8e6c9", "#dcedc8", "#fff9c4",
+              "#ffe0b2", "#ffcdd2", "#ef9a9a")))
+```
+
+:::
+
+::: {.callout-note collapse="true" title="Column definitions and sorting"}
+- **Year** — year of the Uploaded timestamp.
+- **Subm.** — OJS submission ID.
+- **Rnd** — round number per submission, in chronological order; post-revision
+  rounds get the next number after the last review round.
+- **Requested** — editor's revision-request decision (Resubmit / Request
+  Revisions) that opened this round. Empty for round 1.
+- **Uploaded** — when the author handed something over: original submission
+  date for round 1, "New Review Round" click for review rounds 2+, revision
+  file upload date for post-revision rounds.
+- **Reviewers found** — last `Date Confirmed` among reviewers who completed
+  a review (empty for post-revision rounds — no reviewers).
+- **Reviews done** — last `Date Completed` among reviewers (empty for
+  post-revision rounds).
+- **Decided** — round-closing decision date.
+
+Each non-leftmost date cell shows the gap from the previous milestone in the
+row (e.g. `8 Apr (12d)`). Clicking a date column sorts by that gap (or by
+chronology for Requested), not alphabetically. Cell background is shaded by
+day count: green ≤20, yellow ~50, red >100.
+:::
+

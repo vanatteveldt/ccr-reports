@@ -103,6 +103,7 @@ ojs_submissions <- function(client, status = NULL, assigned_to = NULL,
       stage_id      = s$stageId %||% NA_integer_,
       date_submitted = s$dateSubmitted %||% NA_character_,
       last_modified  = s$lastModified %||% NA_character_,
+      section_id     = pub$sectionId %||% NA_integer_,
       authors_string = pub$authorsString %||% NA_character_,
       n_review_assignments = length(s$reviewAssignments %||% list()),
       n_review_rounds      = length(s$reviewRounds %||% list())
@@ -161,6 +162,48 @@ ojs_decisions_bulk <- function(client, ids, max_active = 10) {
       review_round_id = d$reviewRoundId %||% NA_integer_,
       date_decided    = d$dateDecided %||% NA_character_
     ))
+  })
+}
+
+#' Submission files at a given file stage, as a tibble.
+#'
+#' Useful stages: 2=submission, 4=review file, 5=review attachment,
+#' 15=review-revision (author revisions after a review round).
+ojs_files <- function(client, id, file_stage = 15) {
+  out <- ojs_get(client, sprintf("/submissions/%s/files", id),
+                 list(fileStages = file_stage))
+  if (length(out$items) == 0L) return(tibble(
+      submission_id = integer(), file_id = integer(),
+      created_at = character(), uploader = character()
+  ))
+  # the API duplicates items per available locale of the genre name; dedupe
+  # on (id, fileId) to get one row per uploaded file.
+  map_dfr(out$items, function(it) tibble(
+    submission_id = id,
+    file_id       = it$fileId %||% NA_integer_,
+    item_id       = it$id %||% NA_integer_,
+    created_at    = it$createdAt %||% NA_character_,
+    uploader      = it$uploaderUserName %||% NA_character_
+  )) |> distinct(submission_id, file_id, created_at, uploader, .keep_all = FALSE)
+}
+
+#' Files for many submissions in parallel.
+ojs_files_bulk <- function(client, ids, file_stage = 15, max_active = 10) {
+  reqs <- map(ids, function(id) .ojs_req(
+      client, sprintf("/submissions/%s/files", id),
+      list(fileStages = file_stage)
+  ))
+  resps <- req_perform_parallel(reqs, max_active = max_active, on_error = "continue")
+  map2_dfr(ids, resps, function(id, resp) {
+    if (inherits(resp, "error") || is.null(resp)) return(tibble())
+    out <- resp_body_json(resp, simplifyVector = FALSE)
+    if (length(out$items) == 0L) return(tibble())
+    map_dfr(out$items, function(it) tibble(
+      submission_id = id,
+      file_id       = it$fileId %||% NA_integer_,
+      created_at    = it$createdAt %||% NA_character_,
+      uploader      = it$uploaderUserName %||% NA_character_
+    )) |> distinct()
   })
 }
 
