@@ -1116,17 +1116,15 @@ articles_csv <- "ojs_reports/articles-CCR-20251203.csv"
 articles <- read.csv(articles_csv, stringsAsFactors = FALSE,
                      check.names = FALSE)
 
-# Manual email aliases — same person under different addresses. Add lines as
-# new duplicates are spotted; key = alias to fold in, value = canonical email.
-email_aliases <- c(
-    "d.c.trilling@uva.nl"           = "d.c.trilling@vu.nl",
-    "felicia.loecherbach@gmail.com" = "f.loecherbach@uva.nl",
-    "f.loecherbach@vu.nl"           = "f.loecherbach@uva.nl",
-    "hyunjin.song@univie.ac.at"     = "hyunjinsong@yonsei.ac.kr",
-    "andreu.casas@gmail.com"        = "andreu.casas@rhul.ac.uk",
-    "annie.waldherr@uni-muenster.de" = "annie.waldherr@univie.ac.at",
-    "waldherr@uni-muenster.de"       = "annie.waldherr@univie.ac.at"
-)
+# Manual email aliases — same person under different addresses. Kept in a
+# git-ignored CSV (email_aliases.csv with columns: alias, canonical) so the
+# personal addresses don't end up on GitHub. Missing file → no aliasing.
+email_aliases <- if (file.exists("email_aliases.csv")) {
+    .a <- read.csv("email_aliases.csv", stringsAsFactors = FALSE)
+    setNames(tolower(trimws(.a$canonical)), tolower(trimws(.a$alias)))
+} else {
+    character()
+}
 canon_email <- function(e) {
     e <- tolower(trimws(e))
     ifelse(e %in% names(email_aliases), unname(email_aliases[e]), e)

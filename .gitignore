@@ -10,6 +10,9 @@ ojs_reports/
 # Editorial board contact list (contains phone numbers) — decide per-file
 editorialboard.csv
 
+# Personal email-alias map for the Authors and reviewers table
+email_aliases.csv
+
 # R / RStudio
 .Rproj.user/
 .Rhistory
