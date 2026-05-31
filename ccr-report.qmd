@@ -7,6 +7,7 @@ format:
     toc: true
     df-print: kable
     embed-resources: true
+    page-layout: full
 execute:
   echo: false
   warning: false
@@ -971,7 +972,7 @@ ae_round_render(
 }
 </style>
 
-#### Detailed information per review round
+## Submission details
 
 Per-round raw timestamps for every review and post-revision round. Sortable
 by clicking any column header (date columns sort by elapsed days, not text).
@@ -1101,6 +1102,174 @@ Each non-leftmost date cell shows the gap from the previous milestone in the
 row (e.g. `8 Apr (12d)`). Clicking a date column sorts by that gap (or by
 chronology for Requested), not alphabetically. Cell background is shaded by
 day count: green ≤20, yellow ~50, red >100.
+:::
+
+## Authors and reviewers
+
+Everyone who has touched the journal, as author or reviewer. Sortable and
+searchable.
+
+::: {.dt-raw}
+
+```{r people-raw}
+articles_csv <- "ojs_reports/articles-CCR-20251203.csv"
+articles <- read.csv(articles_csv, stringsAsFactors = FALSE,
+                     check.names = FALSE)
+
+# Manual email aliases — same person under different addresses. Add lines as
+# new duplicates are spotted; key = alias to fold in, value = canonical email.
+email_aliases <- c(
+    "d.c.trilling@uva.nl"           = "d.c.trilling@vu.nl",
+    "felicia.loecherbach@gmail.com" = "f.loecherbach@uva.nl",
+    "f.loecherbach@vu.nl"           = "f.loecherbach@uva.nl",
+    "hyunjin.song@univie.ac.at"     = "hyunjinsong@yonsei.ac.kr",
+    "andreu.casas@gmail.com"        = "andreu.casas@rhul.ac.uk",
+    "annie.waldherr@uni-muenster.de" = "annie.waldherr@univie.ac.at",
+    "waldherr@uni-muenster.de"       = "annie.waldherr@univie.ac.at"
+)
+canon_email <- function(e) {
+    e <- tolower(trimws(e))
+    ifelse(e %in% names(email_aliases), unname(email_aliases[e]), e)
+}
+
+n_author_slots <- sum(grepl("^Email address \\(Author ", names(articles)))
+
+author_long <- purrr::map_dfr(seq_len(n_author_slots), function(i) {
+    tibble(
+        submission_id = articles[["Submission ID"]],
+        given         = articles[[sprintf("Given Name (Author %d)", i)]],
+        family        = articles[[sprintf("Family Name (Author %d)", i)]],
+        email         = canon_email(
+            articles[[sprintf("Email address (Author %d)", i)]])
+    )
+}) |>
+    filter(nzchar(email))
+
+sub_outcome <- submissions |>
+    mutate(outcome = bucket(status_label)) |>
+    select(submission_id = id, outcome)
+
+authors_agg <- author_long |>
+    inner_join(sub_outcome, by = "submission_id") |>
+    group_by(email) |>
+    summarise(
+        name_a      = paste(dplyr::first(given), dplyr::first(family)),
+        submitted   = dplyr::n_distinct(submission_id),
+        art_accept  = dplyr::n_distinct(
+            submission_id[outcome == "Accepted"]),
+        .groups = "drop"
+    )
+
+reviewers_agg <- reviews |>
+    mutate(
+        email     = canon_email(`Email address`),
+        name_r    = trimws(paste(`Given Name`, `Family Name`)),
+        responded = nzchar(as.character(date_confirmed)) &
+                    !is.na(date_confirmed),
+        is_accept = declined == "No"  & cancelled == "No" & responded,
+        is_decl   = declined == "Yes" & cancelled == "No",
+        is_ghost  = !responded        & cancelled == "No",
+        active    = cancelled == "No"
+    ) |>
+    filter(nzchar(email)) |>
+    group_by(email) |>
+    summarise(
+        name_r    = dplyr::first(name_r),
+        invited   = sum(active),
+        rev_acc   = sum(is_accept),
+        rev_decl  = sum(is_decl),
+        rev_ghost = sum(is_ghost),
+        .groups   = "drop"
+    )
+
+# Editor classification — by email, with name fallback for EB.
+ae_ids <- read.csv("editors.csv", stringsAsFactors = FALSE)$editor_id
+decision_editor_ids <- unique(decisions$editor_id)
+decision_editor_ids <- decision_editor_ids[!is.na(decision_editor_ids)]
+all_editor_ids <- unique(c(ae_ids, decision_editor_ids))
+editor_users <- ojs_users_bulk(client, all_editor_ids) |>
+    mutate(email = canon_email(email))
+
+ae_emails <- editor_users$email[editor_users$id %in% ae_ids]
+ge_emails <- editor_users$email[
+    editor_users$id %in% decision_editor_ids &
+    !editor_users$id %in% ae_ids]
+
+eb_raw <- read.csv("editorialboard.csv", header = FALSE,
+                   stringsAsFactors = FALSE)
+eb_emails  <- canon_email(eb_raw$V3)
+eb_names   <- tolower(trimws(eb_raw$V1))
+
+classify_editor <- function(email, name) {
+    name_lc <- tolower(trimws(name))
+    dplyr::case_when(
+        email %in% ae_emails ~ "AE",
+        email %in% ge_emails ~ "GE",
+        email %in% eb_emails ~ "EB",
+        name_lc %in% eb_names ~ "EB",
+        TRUE ~ ""
+    )
+}
+
+people <- dplyr::full_join(authors_agg, reviewers_agg, by = "email") |>
+    mutate(
+        Name = dplyr::coalesce(name_r, name_a),
+        across(c(submitted, art_accept,
+                 invited, rev_acc, rev_decl, rev_ghost),
+               ~ tidyr::replace_na(.x, 0L)),
+        Editor = classify_editor(email, Name),
+        Score  = rev_acc + 2L * submitted + 5L * art_accept -
+                 5L * rev_ghost
+    ) |>
+    transmute(
+        Name,
+        Email                = email,
+        Editor,
+        Score,
+        `Reviews invited`    = invited,
+        `Reviews accepted`   = rev_acc,
+        `Reviews declined`   = rev_decl,
+        `Reviews ghosted`    = rev_ghost,
+        `Articles submitted` = submitted,
+        `Articles accepted`  = art_accept
+    ) |>
+    arrange(desc(Score), Name)
+
+datatable(
+    people,
+    rownames = FALSE,
+    filter   = "top",
+    class    = "compact stripe hover row-border",
+    options  = list(pageLength = 25, scrollX = TRUE,
+                    order = list())
+)
+```
+
+:::
+
+::: {.callout-note collapse="true" title="Column definitions and caveats"}
+- **Editor** — `AE` for current or past Associate Editors / EiCs (from
+  `editors.csv`); `GE` for anyone else who acted as decision editor on a
+  manuscript (typically guest editors); `EB` for editorial board members
+  (from `editorialboard.csv`). Priority: AE → GE → EB.
+- **Score** — contributor score: +1 per review accepted, +2 per article
+  submitted, +5 per article accepted, −5 per review ghosted.
+- **Reviews invited** — non-cancelled reviewer invitations across all rounds.
+- **Reviews accepted** — invitations the reviewer agreed to (responded with
+  "Accept"). Includes reviews still in progress; not the same as completed.
+- **Reviews declined** — invitations the reviewer turned down.
+- **Reviews ghosted** — invitations with no response. Accepted + declined +
+  ghosted = invited (cancelled-by-editor excluded).
+- **Articles submitted** — submissions where the person is listed as an
+  author.
+- **Articles accepted** — subset of submitted where the editorial outcome is
+  Accepted (published or in copyediting/production).
+
+People are keyed by email (lowercased). Author data is from the OJS articles
+report dated 2025-12-03 — submissions after that date won't appear here as
+authors yet. Reviewer data covers all rounds through the latest reviews
+report. EB matching falls back to lowercased full-name match when the
+editorial-board CSV email differs from the person's OJS account email.
 :::
 
 :::

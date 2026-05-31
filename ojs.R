@@ -257,6 +257,23 @@ ojs_users <- function(client, max_items = NULL) {
 #' Single user (raw list).
 ojs_user <- function(client, id) ojs_get(client, sprintf("/users/%s", id))
 
+#' Users for many ids in parallel; returns a tibble (id, email, full_name).
+ojs_users_bulk <- function(client, ids, max_active = 10) {
+  reqs <- map(ids, function(id) .ojs_req(client, sprintf("/users/%s", id)))
+  resps <- req_perform_parallel(reqs, max_active = max_active, on_error = "continue")
+  map2_dfr(ids, resps, function(id, resp) {
+    if (inherits(resp, "error") || is.null(resp)) {
+      return(tibble(id = id, email = NA_character_, full_name = NA_character_))
+    }
+    u <- resp_body_json(resp, simplifyVector = FALSE)
+    tibble(
+      id        = id,
+      email     = u$email %||% NA_character_,
+      full_name = u$fullName %||% NA_character_
+    )
+  })
+}
+
 #' Published issues.
 ojs_issues <- function(client, max_items = NULL) {
   items <- ojs_get_all(client, "/issues", max_items = max_items)
