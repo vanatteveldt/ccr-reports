@@ -45,7 +45,11 @@ submissions <- ojs_submissions(client)
 decisions <- ojs_decisions_bulk(client, submissions$id)
 ```
 
-## Submissions by year and final status
+::: {.panel-tabset}
+
+## Submissions and reviewing
+
+### Submissions by year and final status
 
 Pipeline volume per year and what happened to each cohort.
 
@@ -108,7 +112,7 @@ notes, tool announcements — the API doesn't expose section names, so they
 can't be split further from this report alone).
 :::
 
-## Decision turnaround times
+### Decision turnaround times
 
 How fast papers move from submission to first decision, and through subsequent
 review rounds to a final outcome.
@@ -285,7 +289,7 @@ bind_rows(by_year_rounds, total_rounds) |>
   from a previous OJS install and their decision history wasn't carried over.
 :::
 
-### Round timing decomposed
+#### Round timing decomposed
 
 Where editorial cycles actually spend their time: waiting on authors, finding
 reviewers, waiting on reviews, or deciding.
@@ -494,7 +498,109 @@ deadlines, not actual confirm/complete timestamps); revision file uploads from
 `/submissions/{id}/files?fileStages=15`.
 :::
 
-## AE statistics
+### Reviewer response and turnaround
+
+Per-reviewer behavior on round-1 invitations: how many were invited, how many
+finished a review, and how long each step took.
+
+```{r reviewer-stats}
+closed_r1 <- rounds |>
+    filter(round_num == 1) |>
+    pull(submission_id) |>
+    unique()
+
+reviewer_rows <- reviews |>
+    filter(round == 1, submission_id %in% closed_r1) |>
+    mutate(
+        date_assigned = parse_dt(date_assigned),
+        responded     = nzchar(as.character(date_confirmed)) &
+                        !is.na(date_confirmed),
+        accepted      = declined == "No"  & cancelled == "No" & responded,
+        declined_resp = declined == "Yes" & cancelled == "No",
+        ghosted       = !responded        & cancelled == "No",
+        days_to_decline  = ifelse(declined_resp,
+            as.numeric(difftime(date_confirmed, date_assigned, units = "days")),
+            NA_real_),
+        days_to_accept   = ifelse(accepted,
+            as.numeric(difftime(date_confirmed, date_assigned, units = "days")),
+            NA_real_),
+        days_to_complete = ifelse(completed_ok,
+            as.numeric(difftime(date_completed, date_confirmed, units = "days")),
+            NA_real_)
+    ) |>
+    inner_join(
+        subs_dt |> transmute(submission_id = id,
+                             year = substr(as.character(date_submitted), 1, 4)),
+        by = "submission_id"
+    ) |>
+    filter(year >= "2024")
+
+mean_days <- function(x) {
+    x <- x[!is.na(x)]
+    if (length(x) == 0) "—" else sprintf("%.1f", mean(x))
+}
+
+reviewer_row <- function(df) {
+    active <- df |> filter(cancelled == "No")
+    n_subs <- length(unique(active$submission_id))
+    tibble(
+        invited     = ifelse(n_subs > 0,
+            sprintf("%.1f", nrow(active) / n_subs), "—"),
+        completed   = ifelse(n_subs > 0,
+            sprintf("%.1f", sum(active$completed_ok) / n_subs), "—"),
+        t_decline   = mean_days(active$days_to_decline),
+        t_accept    = mean_days(active$days_to_accept),
+        t_complete  = mean_days(active$days_to_complete),
+        pct_accept  = ifelse(nrow(active) > 0,
+            sprintf("%.0f%%", 100 * sum(active$accepted) / nrow(active)),
+            "—"),
+        pct_decline = ifelse(nrow(active) > 0,
+            sprintf("%.0f%%", 100 * sum(active$declined_resp) / nrow(active)),
+            "—"),
+        pct_ghost   = ifelse(nrow(active) > 0,
+            sprintf("%.0f%%", 100 * sum(active$ghosted) / nrow(active)),
+            "—")
+    )
+}
+
+by_year_rev <- reviewer_rows |>
+    group_by(Year = year) |>
+    group_modify(~ reviewer_row(.x)) |>
+    ungroup() |>
+    arrange(Year)
+
+total_rev <- reviewer_row(reviewer_rows) |>
+    mutate(Year = "Total") |>
+    select(Year, everything())
+
+bind_rows(by_year_rev, total_rev) |>
+    setNames(c("Year", "Invited / ms.", "Completed / ms.",
+               "Days to decline", "Days to accept", "Days to complete",
+               "% accepted", "% declined", "% ghosted")) |>
+    kable(caption = "Reviewer response and turnaround on round-1 invitations")
+```
+
+::: {.callout-note collapse="true" title="Column definitions"}
+- **Invited / ms.** — average non-cancelled round-1 reviewer invitations per
+  manuscript that received any.
+- **Completed / ms.** — average reviewers per manuscript who accepted *and*
+  submitted a review.
+- **Days to decline / accept / complete** — per-reviewer means: time from
+  invitation to decline response, invitation to acceptance, and acceptance to
+  review submission.
+- **% accepted / % declined / % ghosted** — share of non-cancelled
+  invitations where the reviewer accepted, declined, or never responded. The
+  three sum to 100%.
+
+Restricted to the first review round (subsequent rounds typically re-invite the
+same reviewers, which would double-count their behavior), to manuscripts
+submitted from 2024 onward, and to manuscripts whose round 1 has closed with
+an editorial decision (Accept / Decline / Request Revisions / Resubmit for
+Review) — ongoing rounds are excluded so they don't pull down the completed
+count. Year is the submission year.
+:::
+
+## AE Statistics
 
 Current workload and recent throughput per active AE/EiC. Two tables: past
 365 days, and all time.
@@ -766,7 +872,7 @@ The 365-day window cuts by *decision date* for the time-to-decision medians
 and the accept rate, but by *submission date* for the "Assigned (365d)" count.
 :::
 
-### Round timing per AE
+#### Round timing per AE
 
 Same intervals as the decomposed table above, broken down by handling AE/EiC.
 Small N — single slow rounds will move medians a lot.
@@ -865,7 +971,7 @@ ae_round_render(
 }
 </style>
 
-### Detailed information per review round
+#### Detailed information per review round
 
 Per-round raw timestamps for every review and post-revision round. Sortable
 by clicking any column header (date columns sort by elapsed days, not text).
@@ -995,5 +1101,7 @@ Each non-leftmost date cell shows the gap from the previous milestone in the
 row (e.g. `8 Apr (12d)`). Clicking a date column sorts by that gap (or by
 chronology for Requested), not alphabetically. Cell background is shaded by
 day count: green ≤20, yellow ~50, red >100.
+:::
+
 :::
 
